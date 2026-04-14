@@ -52,7 +52,9 @@ export async function fetchLitellmModels(
   apiKey?: string,
 ): Promise<{ reachable: boolean; models: string[] }> {
   try {
-    const url = `${baseUrl.replace(/\/+$/, "")}/v1/models`;
+    // Strip a trailing `/v1` so OpenAI-style base URLs don't become `/v1/v1/models`.
+    const normalized = baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "");
+    const url = `${normalized}/v1/models`;
     const headers: Record<string, string> = {};
     if (apiKey) {
       headers["Authorization"] = `Bearer ${apiKey}`;
@@ -99,14 +101,23 @@ function applyLitellmProviderWithModels(
     contextWindow: 128_000,
     maxTokens: 8_192,
   };
-  const models: ModelDefinitionConfig[] = discoveredModelIds.map((id) =>
-    id === defaultModel.id ? defaultModel : { ...defaultDiscoveredModel, id, name: id },
-  );
+  const existingProvider = cfg.models?.providers?.litellm;
+  // Preserve any previously curated metadata (contextWindow, input, cost, ...)
+  // for models that are still present on the proxy. Drops entries that are no
+  // longer discovered so stale models are not kept alive across re-runs.
+  const existingById = new Map<string, ModelDefinitionConfig>();
+  for (const m of existingProvider?.models ?? []) {
+    if (m?.id) existingById.set(m.id, m);
+  }
+  const models: ModelDefinitionConfig[] = discoveredModelIds.map((id) => {
+    if (id === defaultModel.id) return defaultModel;
+    const prior = existingById.get(id);
+    return prior ? { ...defaultDiscoveredModel, ...prior, id, name: prior.name ?? id } : { ...defaultDiscoveredModel, id, name: id };
+  });
   // Always include the default model definition even if not discovered.
   if (!discoveredModelIds.includes(defaultModel.id)) {
     models.push(defaultModel);
   }
-  const existingProvider = cfg.models?.providers?.litellm;
   return {
     ...cfg,
     models: {
@@ -128,7 +139,15 @@ function applyLitellmProviderWithModels(
 
 export async function configureLitellmNonInteractive(ctx: ProviderAuthMethodNonInteractiveContext) {
   const customBaseUrl = normalizeOptionalSecretInput(ctx.opts.customBaseUrl);
-  const baseUrl = (customBaseUrl?.trim() || LITELLM_BASE_URL).replace(/\/+$/, "");
+  // Precedence: CLI flag > existing configured baseUrl > default. Avoids
+  // overwriting a remote proxy with localhost when onboarding is re-run
+  // without --custom-base-url (for example, to refresh the API key).
+  const existingBaseUrl = ctx.config.models?.providers?.litellm?.baseUrl;
+  const baseUrl = (
+    customBaseUrl?.trim() ||
+    (typeof existingBaseUrl === "string" && existingBaseUrl.trim()) ||
+    LITELLM_BASE_URL
+  ).replace(/\/+$/, "");
   const customModelId = normalizeOptionalSecretInput(ctx.opts.customModelId);
 
   // Resolve API key through the standard flow.
